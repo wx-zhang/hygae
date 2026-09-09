@@ -1,0 +1,36 @@
+align_two_cube:
+  env_name: primitive_skill
+  env_config:
+    env_id: AlignTwoCube
+    render_mode: vision
+    prompt_format: grounding_worldmodeling
+    use_state_reward: true
+  train_size: 10000
+  test_size: 128
+place_two_cube:
+  env_name: primitive_skill
+  env_config:
+    env_id: PlaceTwoCube
+    render_mode: vision
+    prompt_format: grounding_worldmodeling
+    use_state_reward: true
+  train_size: 10000
+  test_size: 128
+stack_three_cube:
+  env_name: primitive_skill
+  env_config:
+    env_id: StackThreeCube
+    render_mode: vision
+    prompt_format: grounding_worldmodeling
+    use_state_reward: true
+  train_size: 10000
+  test_size: 128
+put_apple_in_drawer:
+  env_name: primitive_skill
+  env_config:
+    env_id: PutAppleInDrawer
+    render_mode: vision
+    prompt_format: grounding_worldmodeling
+    use_state_reward: true
+  train_size: 10000
+  test_size: 128

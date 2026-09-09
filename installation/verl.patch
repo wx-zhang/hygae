@@ -1,0 +1,2029 @@
+diff --git a/verl/models/transformers/modeling_qwen_2_5_vl_patch.py b/verl/models/transformers/modeling_qwen_2_5_vl_patch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4e7700a4293045f27615df6b5aa69575549d7556
+--- /dev/null
++++ b/verl/models/transformers/modeling_qwen_2_5_vl_patch.py
+@@ -0,0 +1,343 @@
++import torch
++import torch.nn as nn
++from torch.nn import CrossEntropyLoss
++from typing import Optional, Tuple, List, Union
++
++from transformers import (
++    AutoConfig,
++    AutoModelForTokenClassification,
++    Qwen2_5_VLPreTrainedModel,
++    Qwen2_5_VLModel,
++    Qwen2_5_VLConfig
++)
++from transformers.modeling_outputs import TokenClassifierOutput
++from transformers.utils import (
++    add_start_docstrings,
++    add_start_docstrings_to_model_forward,
++    add_code_sample_docstrings,
++)
++from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
++    Qwen2_5_VLPreTrainedModel,
++    Qwen2_5_VLModel,
++    Qwen2_5_VL_START_DOCSTRING,
++    QWEN2_5_VL_INPUTS_DOCSTRING,
++    Qwen2_5_VisionTransformerPretrainedModel,
++    _CONFIG_FOR_DOC,
++)
++_CHECKPOINT_FOR_DOC = "meta-qwen2.5/Qwen2.5-7b-Instruct"
++@add_start_docstrings(
++    """
++    The Qwen2_5_VL Model transformer with a token classification head on top (a linear layer on top of the hidden-states
++    output) e.g. for Named-Entity-Recognition (NER) tasks.
++    """,
++    Qwen2_5_VL_START_DOCSTRING,
++)
++class Qwen2_5_VLForTokenClassification(Qwen2_5_VLPreTrainedModel):
++    def __init__(self, config):
++        super().__init__(config)
++        self.num_labels = config.num_labels
++
++        # Initialize the visual module
++        self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config)
++
++        # Initialize the main language model
++        self.model = Qwen2_5_VLModel(config)
++
++        # Set up the classifier dropout
++        if getattr(config, "classifier_dropout", None) is not None:
++            classifier_dropout = config.classifier_dropout
++        elif getattr(config, "hidden_dropout", None) is not None:
++            classifier_dropout = config.hidden_dropout
++        else:
++            classifier_dropout = 0.1
++
++        self.dropout = nn.Dropout(classifier_dropout)
++        self.score = nn.Linear(config.hidden_size, config.num_labels)
++
++        # Initialize weights and apply final processing
++        self.post_init()
++
++        # Cache for rope_deltas
++        self.rope_deltas = None
++
++    def get_input_embeddings(self):
++        return self.model.embed_tokens
++
++    def set_input_embeddings(self, value):
++        self.model.embed_tokens = value
++
++    def get_rope_index(
++        self,
++        input_ids: Optional[torch.LongTensor] = None,
++        image_grid_thw: Optional[torch.LongTensor] = None,
++        video_grid_thw: Optional[torch.LongTensor] = None,
++        second_per_grid_ts: Optional[torch.Tensor] = None,
++        attention_mask: Optional[torch.Tensor] = None,
++    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        """
++        Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
++        This is taken directly from Qwen2_5_VLForConditionalGeneration.
++        """
++        spatial_merge_size = self.config.vision_config.spatial_merge_size
++        image_token_id = self.config.image_token_id
++        video_token_id = self.config.video_token_id
++        vision_start_token_id = self.config.vision_start_token_id
++        mrope_position_deltas = []
++        if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
++            total_input_ids = input_ids
++            if attention_mask is None:
++                attention_mask = torch.ones_like(total_input_ids)
++            position_ids = torch.ones(
++                3,
++                input_ids.shape[0],
++                input_ids.shape[1],
++                dtype=input_ids.dtype,
++                device=input_ids.device,
++            )
++            image_index, video_index = 0, 0
++            attention_mask = attention_mask.to(total_input_ids.device)
++            for i, input_ids in enumerate(total_input_ids):
++                input_ids = input_ids[attention_mask[i] == 1]
++                image_nums, video_nums = 0, 0
++                vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
++                vision_tokens = input_ids[vision_start_indices + 1]
++                image_nums = (vision_tokens == image_token_id).sum()
++                video_nums = (vision_tokens == video_token_id).sum()
++                input_tokens = input_ids.tolist()
++                llm_pos_ids_list: list = []
++                st = 0
++                remain_images, remain_videos = image_nums, video_nums
++                for _ in range(image_nums + video_nums):
++                    if image_token_id in input_tokens and remain_images > 0:
++                        ed_image = input_tokens.index(image_token_id, st)
++                    else:
++                        ed_image = len(input_tokens) + 1
++                    if video_token_id in input_tokens and remain_videos > 0:
++                        ed_video = input_tokens.index(video_token_id, st)
++                    else:
++                        ed_video = len(input_tokens) + 1
++                    if ed_image < ed_video:
++                        t, h, w = (
++                            image_grid_thw[image_index][0],
++                            image_grid_thw[image_index][1],
++                            image_grid_thw[image_index][2],
++                        )
++                        second_per_grid_t = 0
++                        image_index += 1
++                        remain_images -= 1
++                        ed = ed_image
++
++                    else:
++                        t, h, w = (
++                            video_grid_thw[video_index][0],
++                            video_grid_thw[video_index][1],
++                            video_grid_thw[video_index][2],
++                        )
++                        if second_per_grid_ts is not None:
++                            second_per_grid_t = second_per_grid_ts[video_index]
++                        else:
++                            second_per_grid_t = 1.0
++                        video_index += 1
++                        remain_videos -= 1
++                        ed = ed_video
++                    llm_grid_t, llm_grid_h, llm_grid_w = (
++                        t.item(),
++                        h.item() // spatial_merge_size,
++                        w.item() // spatial_merge_size,
++                    )
++                    text_len = ed - st
++
++                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
++                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
++
++                    range_tensor = torch.arange(llm_grid_t).view(-1, 1)
++                    expanded_range = range_tensor.expand(-1, llm_grid_h * llm_grid_w)
++
++                    time_tensor = expanded_range * second_per_grid_t * self.config.vision_config.tokens_per_second
++
++                    time_tensor_long = time_tensor.long()
++                    t_index = time_tensor_long.flatten()
++
++                    h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
++                    w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
++                    llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
++                    st = ed + llm_grid_t * llm_grid_h * llm_grid_w
++
++                if st < len(input_tokens):
++                    st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
++                    text_len = len(input_tokens) - st
++                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
++
++                llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
++                position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
++                mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
++            mrope_position_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
++            return position_ids, mrope_position_deltas
++        else:
++            if attention_mask is not None:
++                position_ids = attention_mask.long().cumsum(-1) - 1
++                position_ids.masked_fill_(attention_mask == 0, 1)
++                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
++                max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
++                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
++            else:
++                position_ids = (
++                    torch.arange(input_ids.shape[1], device=input_ids.device)
++                    .view(1, 1, -1)
++                    .expand(3, input_ids.shape[0], -1)
++                )
++                mrope_position_deltas = torch.zeros(
++                    [input_ids.shape[0], 1],
++                    device=input_ids.device,
++                    dtype=input_ids.dtype,
++                )
++
++            return position_ids, mrope_position_deltas
++
++    @add_start_docstrings_to_model_forward(QWEN2_5_VL_INPUTS_DOCSTRING)
++    @add_code_sample_docstrings(
++        checkpoint=_CHECKPOINT_FOR_DOC,
++        output_type=TokenClassifierOutput,
++        config_class=_CONFIG_FOR_DOC,
++    )
++    def forward(
++        self,
++        input_ids: Optional[torch.LongTensor] = None,
++        attention_mask: Optional[torch.Tensor] = None,
++        position_ids: Optional[torch.LongTensor] = None,
++        past_key_values: Optional[List[torch.FloatTensor]] = None,
++        inputs_embeds: Optional[torch.FloatTensor] = None,
++        labels: Optional[torch.LongTensor] = None,
++        use_cache: Optional[bool] = None,
++        output_attentions: Optional[bool] = None,
++        output_hidden_states: Optional[bool] = None,
++        return_dict: Optional[bool] = None,
++        pixel_values: Optional[torch.Tensor] = None,
++        pixel_values_videos: Optional[torch.FloatTensor] = None,
++        image_grid_thw: Optional[torch.LongTensor] = None,
++        video_grid_thw: Optional[torch.LongTensor] = None,
++        rope_deltas: Optional[torch.LongTensor] = None,
++        cache_position: Optional[torch.LongTensor] = None,
++        second_per_grid_ts: Optional[torch.Tensor] = None,
++    ) -> Union[Tuple, TokenClassifierOutput]:
++        r"""
++        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
++            Labels for computing the token classification loss. Indices should be in `[0, ..., config.num_labels - 1]`.
++        """
++        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
++
++        # Process inputs with visual content
++        if inputs_embeds is None:
++            inputs_embeds = self.model.embed_tokens(input_ids)
++            if pixel_values is not None:
++                pixel_values = pixel_values.type(self.visual.dtype)
++                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
++                n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
++                n_image_features = image_embeds.shape[0]
++                if n_image_tokens != n_image_features:
++                    raise ValueError(
++                        f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
++                    )
++
++                mask = input_ids == self.config.image_token_id
++                mask_unsqueezed = mask.unsqueeze(-1)
++                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
++                image_mask = mask_expanded.to(inputs_embeds.device)
++
++                image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
++                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
++
++            if pixel_values_videos is not None:
++                pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
++                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
++                n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
++                n_video_features = video_embeds.shape[0]
++                if n_video_tokens != n_video_features:
++                    raise ValueError(
++                        f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
++                    )
++
++                mask = input_ids == self.config.video_token_id
++                mask_unsqueezed = mask.unsqueeze(-1)
++                mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
++                video_mask = mask_expanded.to(inputs_embeds.device)
++
++                video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
++                inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
++
++            if attention_mask is not None:
++                attention_mask = attention_mask.to(inputs_embeds.device)
++
++        # Calculate position IDs if needed
++        if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
++            # calculate RoPE index in the pre-fill stage only
++            if (
++                (cache_position is not None and cache_position[0] == 0)
++                or self.rope_deltas is None
++                or (past_key_values is None or past_key_values.get_seq_length() == 0)
++            ):
++                position_ids, rope_deltas = self.get_rope_index(
++                    input_ids,
++                    image_grid_thw,
++                    video_grid_thw,
++                    second_per_grid_ts,
++                    attention_mask,
++                )
++                self.rope_deltas = rope_deltas
++            # then use the prev pre-calculated rope-deltas to get the correct position ids
++            else:
++                batch_size, seq_length, _ = inputs_embeds.shape
++                delta = (
++                    (cache_position[0] + self.rope_deltas).to(inputs_embeds.device)
++                    if cache_position is not None
++                    else 0
++                )
++                position_ids = torch.arange(seq_length, device=inputs_embeds.device)
++                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
++                if cache_position is not None:  # otherwise `deltas` is an int `0`
++                    delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
++                position_ids = position_ids.add(delta)
++                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
++
++        # Get the model outputs
++        outputs = self.model(
++            input_ids=None,
++            position_ids=position_ids,
++            attention_mask=attention_mask,
++            past_key_values=past_key_values,
++            inputs_embeds=inputs_embeds,
++            use_cache=use_cache,
++            output_attentions=output_attentions,
++            output_hidden_states=output_hidden_states,
++            return_dict=return_dict,
++            cache_position=cache_position,
++        )
++
++        sequence_output = outputs[0]
++        sequence_output = self.dropout(sequence_output)
++        logits = self.score(sequence_output)
++
++        loss = None
++        if labels is not None:
++            loss_fct = CrossEntropyLoss()
++            # Only keep active parts of the loss
++            if attention_mask is not None:
++                active_loss = attention_mask.view(-1) == 1
++                active_logits = logits.view(-1, self.num_labels)
++                active_labels = torch.where(
++                    active_loss, labels.view(-1), torch.tensor(loss_fct.ignore_index).type_as(labels)
++                )
++                loss = loss_fct(active_logits, active_labels)
++            else:
++                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
++
++        if not return_dict:
++            output = (logits,) + outputs[2:]
++            return ((loss,) + output) if loss is not None else output
++
++        return TokenClassifierOutput(
++            loss=loss,
++            logits=logits,
++            hidden_states=outputs.hidden_states if hasattr(outputs, "hidden_states") else None,
++            attentions=outputs.attentions if hasattr(outputs, "attentions") else None,
++        )
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+index 40bcd0e39b5e46e710a0bdd76237073de344e1b3..009ba6dd0165220bec4b3372a0555657c508b03a 100644
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -31,6 +31,7 @@ actor_rollout_ref:
+     ppo_max_token_len_per_gpu: 16384 # n * ${data.max_prompt_length} + ${data.max_response_length}
+     grad_clip: 1.0
+     clip_ratio: 0.2
++    clip_ratio_c: 3.0
+     entropy_coeff: 0.001
+     use_kl_loss: False # True for GRPO
+     kl_loss_coef: 0.001 # for grpo
+@@ -91,6 +92,7 @@ actor_rollout_ref:
+     do_sample: True
+     # number of responses (i.e. num sample times)
+     n: 1 # > 1 for grpo
++    limit_mm_per_prompt: 5 # for image limits in vllm rollout (default to 1, now we increase it to 5)
+ 
+ critic:
+   strategy: fsdp
+@@ -174,7 +176,7 @@ trainer:
+   n_gpus_per_node: 8
+   save_freq: -1
+   # auto: find the last ckpt to resume. If can't find, start from scratch
+-  resume_mode: auto # or auto or resume_path if 
++  resume_mode: auto # or auto or resume_path if
+   resume_from_path: False
+   test_freq: -1
+   critic_warmup: 0
+diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
+index 4d0b8edfff57723f42bab0255003868e75dc9db4..08d681addf71bc690b969e5a473e2668f86b84c0 100644
+--- a/verl/trainer/ppo/core_algos.py
++++ b/verl/trainer/ppo/core_algos.py
+@@ -18,13 +18,57 @@ The function implemented in this file should be used by trainer with different d
+ implement PPO
+ """
+ 
++from collections import defaultdict
++
+ import numpy as np
+ import torch
+-from collections import defaultdict
+ 
+ import verl.utils.torch_functional as verl_F
+ 
+ 
++def get_current_turn_length(
++    loss_mask: torch.Tensor,
++    reward_mask: torch.Tensor,
++    cur_position: int,
++    batch_idx: int = 0,
++) -> int:
++    """
++    Compute the length of the current turn based on loss_mask and reward_mask.
++
++    Args:
++        loss_mask (torch.Tensor): (bs, seq_len). 1 indicates token belongs to a valid turn.
++        reward_mask (torch.Tensor): (bs, seq_len). 1 indicates EOS token (end of a turn).
++        cur_position (int): Current token position (index).
++        batch_idx (int): Which sequence in the batch to use. Default is 0.
++
++    Returns:
++        int: The length of the current turn.
++    """
++    # Check if current position is inside a valid turn
++    if loss_mask[batch_idx, cur_position] == 0:
++        raise ValueError(f"cur_position {cur_position} is not inside any turn.")
++
++    # Step 1: Find the start position of the current turn
++    # Move backward until we hit the first token of the turn
++    start_pos = cur_position.clone().detach()
++
++    while start_pos >= 0 and loss_mask[batch_idx, start_pos - 1] == 1:
++        start_pos -= 1
++
++    # Step 2: Find the EOS position of the current turn
++    # Move forward until we find reward_mask == 1 (end of this turn)
++    eos_pos = cur_position.clone().detach()
++    seq_len = loss_mask.size(1)
++    while eos_pos < seq_len and loss_mask[batch_idx, eos_pos] == 1:
++        eos_pos += 1
++
++
++
++    # Step 3: Compute the turn length (inclusive of both start and EOS)
++    turn_length = eos_pos - start_pos
++
++    return turn_length
++
+ class AdaptiveKLController:
+     """
+     Adaptive KL controller described in the paper:
+@@ -54,21 +98,720 @@ class FixedKLController:
+ 
+ 
+ def get_kl_controller(config):
+-    if config.critic.kl_ctrl.type == 'fixed':
++    if config.critic.kl_ctrl.type == "fixed":
+         kl_ctrl = FixedKLController(kl_coef=config.critic.kl_ctrl.kl_coef)
+-    elif config.critic.kl_ctrl.type == 'adaptive':
+-        assert config.kl_ctrl.horizon > 0, f'horizon must be larger than 0. Got {config.critic.kl_ctrl.horizon}'
+-        kl_ctrl = AdaptiveKLController(init_kl_coef=config.critic.kl_ctrl.kl_coef,
+-                                       target_kl=config.critic.kl_ctrl.target_kl,
+-                                       horizon=config.critic.kl_ctrl.horizon)
++    elif config.critic.kl_ctrl.type == "adaptive":
++        assert (
++            config.kl_ctrl.horizon > 0
++        ), f"horizon must be larger than 0. Got {config.critic.kl_ctrl.horizon}"
++        kl_ctrl = AdaptiveKLController(
++            init_kl_coef=config.critic.kl_ctrl.kl_coef,
++            target_kl=config.critic.kl_ctrl.target_kl,
++            horizon=config.critic.kl_ctrl.horizon,
++        )
+     else:
+-        raise ValueError('Unknown kl_ctrl type')
++        raise ValueError("Unknown kl_ctrl type")
+ 
+     return kl_ctrl
+ 
+ 
+-def compute_gae_advantage_return(token_level_rewards: torch.Tensor, values: torch.Tensor, eos_mask: torch.Tensor,
+-                                 gamma: torch.Tensor, lam: torch.Tensor):
++def compute_bi_advantages(
++    token_level_rewards: torch.Tensor,
++    eos_mask: torch.Tensor,
++    index: torch.Tensor,
++    reward_masks: torch.Tensor,
++    values: torch.Tensor,
++    gamma: float,
++    lam: float,
++    epsilon: float = 1e-6,
++):
++    """Modified GAE calculation that handle multi-turn with loss mask.
++    Here for each token, we compute the two advantages:
++    1. the advantage of the token sequence according to the semantic reward
++    2. the advantage of the action sequence according to the simulator reward
++    For the token sequence advantage, we use the GRPO advantage calculation, so that the two sequence do not share the value function.
++
++    Args:
++        token_level_rewards: `(torch.Tensor)`
++            shape: (bs, response_length)
++        eos_mask: `(torch.Tensor)`
++            shape: (bs, response_length)
++        reward_masks: `(torch.Tensor)`
++            shape: (bs, response_length). 1 for reward position (end of each llm response)
++        values: `(torch.Tensor)`
++            shape: (bs, response_length)
++        gamma: `(float)`
++            discounted factor used in RL for per-turn reward
++        lam: `(float)`
++            lambda value when computing Generalized Advantage Estimation
++
++    Returns:
++        advantages: `(torch.Tensor)`
++            shape: (bs, response_length)
++        Returns: `(torch.Tensor)`
++            shape: (bs, response_length)
++    """
++    response_length = token_level_rewards.shape[-1]
++    scores = token_level_rewards.sum(dim=-1)
++
++    id2score = defaultdict(list)
++    id2mean = {}
++    id2std = {}
++
++    with torch.no_grad():
++        bsz = scores.shape[0]
++        for i in range(bsz):
++            id2score[index[i]].append(scores[i])
++        for idx in id2score:
++            if len(id2score[idx]) == 1:
++                id2mean[idx] = torch.tensor(0.0)
++                id2std[idx] = torch.tensor(1.0)
++            elif len(id2score[idx]) > 1:
++                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
++                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
++            else:
++                raise ValueError(f"no score in prompt index: {idx}")
++        for i in range(bsz):
++            scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
++        scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
++
++        # then we apply turn-wise GAE to the action sequence advantage
++        advantages = torch.zeros_like(token_level_rewards)
++        returns = torch.zeros_like(token_level_rewards)
++        for i in range(bsz):
++            eos_positions = reward_masks[i].nonzero(as_tuple=True)[0]
++            last_gae_lam = 0
++            for j in range(len(eos_positions) - 1, -1, -1):
++                cur_pos = eos_positions[j]
++                if j == len(eos_positions) - 1:
++                    next_value = 0
++                else:
++                    next_pos = eos_positions[j + 1]
++                    next_value = values[i, next_pos]
++                delta = (
++                    token_level_rewards[i, cur_pos]
++                    + gamma * next_value
++                    - values[i, cur_pos]
++                )
++                last_gae_lam = delta + gamma * lam * last_gae_lam
++                advantages[i, cur_pos] = last_gae_lam
++            for j, pos in enumerate(eos_positions):
++                returns[i, pos] = advantages[i, pos] + values[i, pos]
++            valid_positions = eos_mask[i].nonzero(as_tuple=True)[0]
++
++            cur_adv = 0
++            for j in range(len(valid_positions) - 1, -1, -1):
++                cur_pos = valid_positions[j]
++                if cur_pos not in eos_positions:
++                    advantages[i, cur_pos] = cur_adv
++                else:
++                    cur_adv = advantages[i, cur_pos]
++        scores = scores + advantages
++        returns = returns
++    return scores, returns
++
++
++def compute_token_sequence_advantage(
++    token_level_rewards: torch.Tensor,
++    eos_mask: torch.Tensor,
++    values: torch.Tensor,
++    index: torch.Tensor,
++    loss_mask: torch.Tensor,
++    gamma: float,
++    lam: float,
++    epsilon: float = 1e-6,
++):
++    """Modified GAE calculation that handle multi-turn with loss mask
++    Here we should also ensure that the trajectory score is given at the last valid token instead of last token
++    Seems it's true in reward manager
++    Args:
++        token_level_rewards: `(torch.Tensor)`
++            shape: (bs, response_length)
++        values: `(torch.Tensor)`
++            shape: (bs, response_length)
++        loss_mask: `(torch.Tensor)`
++            shape: (bs, response_length). 1 for llm_raw_response, 0 for environment info and paddings
++        gamma: `(float)`
++            discounted factor used in RL
++        lam: `(float)`
++            lambda value when computing Generalized Advantage Estimation
++
++    Returns:
++        advantages: `(torch.Tensor)`
++            shape: (bs, response_length)
++        Returns: `(torch.Tensor)`
++            shape: (bs, response_length)
++    """
++    with torch.no_grad():
++        batch_size, gen_len = token_level_rewards.shape
++        advantages = torch.zeros_like(token_level_rewards)
++        returns = torch.zeros_like(token_level_rewards)
++        scores = token_level_rewards.sum(dim=-1)
++        bsz = scores.shape[0]
++        response_length = token_level_rewards.shape[-1]
++        id2score = defaultdict(list)
++        id2mean = {}
++        id2std = {}
++        for i in range(bsz):
++            id2score[index[i]].append(scores[i])
++        for idx in id2score:
++            if len(id2score[idx]) == 1:
++                id2mean[idx] = torch.tensor(0.0)
++                id2std[idx] = torch.tensor(1.0)
++            elif len(id2score[idx]) > 1:
++                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
++                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
++            else:
++                raise ValueError(f"no score in prompt index: {idx}")
++        for i in range(bsz):
++            scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
++        scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
++
++        for b in range(batch_size):
++            lastgaelam = 0.0
++
++            # Find the valid token positions (where loss_mask is 1)
++            valid_positions = loss_mask[b].nonzero(as_tuple=True)[0]
++
++            if len(valid_positions) == 0:
++                continue
++
++            for i in range(len(valid_positions) - 1, -1, -1):
++                curr_pos = valid_positions[i]
++
++                # Get the next value
++                if i < len(valid_positions) - 1:
++                    # Next valid position
++                    next_pos = valid_positions[i + 1]
++                    nextvalue = values[b, next_pos]
++
++                else:
++                    # Last valid position
++                    nextvalue = 0.0
++
++                # Calculate delta using the next valid token
++                delta = (
++                    token_level_rewards[b, curr_pos]
++                    + gamma * nextvalue
++                    - values[b, curr_pos]
++                )
++
++                # Update advantage estimate
++                lastgaelam = delta + gamma * lam * lastgaelam
++                advantages[b, curr_pos] = lastgaelam
++
++            # Calculate returns for valid positions
++            for i, pos in enumerate(valid_positions):
++                returns[b, pos] = advantages[b, pos] + values[b, pos]
++        advantages += scores
++        advantages = verl_F.masked_whiten(advantages, loss_mask)
++
++    return advantages, returns
++
++
++def compute_gae_advantage_return_with_loss_mask(
++    token_level_rewards: torch.Tensor,
++    values: torch.Tensor,
++    loss_mask: torch.Tensor,
++    gamma: float,
++    lam: float,
++):
++    """Modified GAE calculation that handle multi-turn with loss mask
++    Here we should also ensure that the trajectory score is given at the last valid token instead of last token
++    Seems it's true in reward manager
++    Args:
++        token_level_rewards: `(torch.Tensor)`
++            shape: (bs, response_length)
++        values: `(torch.Tensor)`
++            shape: (bs, response_length)
++        loss_mask: `(torch.Tensor)`
++            shape: (bs, response_length). 1 for llm_raw_response, 0 for environment info and paddings
++        gamma: `(float)`
++            discounted factor used in RL
++        lam: `(float)`
++            lambda value when computing Generalized Advantage Estimation
++
++    Returns:
++        advantages: `(torch.Tensor)`
++            shape: (bs, response_length)
++        Returns: `(torch.Tensor)`
++            shape: (bs, response_length)
++    """
++    with torch.no_grad():
++        batch_size, gen_len = token_level_rewards.shape
++        advantages = torch.zeros_like(token_level_rewards)
++        returns = torch.zeros_like(token_level_rewards)
++
++        for b in range(batch_size):
++            lastgaelam = 0.0
++
++            # Find the valid token positions (where loss_mask is 1)
++            valid_positions = loss_mask[b].nonzero(as_tuple=True)[0]
++
++            if len(valid_positions) == 0:
++                continue
++
++            for i in range(len(valid_positions) - 1, -1, -1):
++                curr_pos = valid_positions[i]
++
++                # Get the next value
++                if i < len(valid_positions) - 1:
++                    # Next valid position
++                    next_pos = valid_positions[i + 1]
++                    nextvalue = values[b, next_pos]
++
++                else:
++                    # Last valid position
++                    nextvalue = 0.0
++
++                # Calculate delta using the next valid token
++                delta = (
++                    token_level_rewards[b, curr_pos]
++                    + gamma * nextvalue
++                    - values[b, curr_pos]
++                )
++
++                # Update advantage estimate
++                lastgaelam = delta + gamma * lam * lastgaelam
++                advantages[b, curr_pos] = lastgaelam
++
++            # Calculate returns for valid positions
++            for i, pos in enumerate(valid_positions):
++                returns[b, pos] = advantages[b, pos] + values[b, pos]
++
++        advantages = verl_F.masked_whiten(advantages, loss_mask)
++
++    return advantages, returns
++
++
++def compute_bi_level_gae_advantage_return(
++    token_level_rewards: torch.Tensor,
++    reward_mask: torch.Tensor,
++    values: torch.Tensor,
++    loss_mask: torch.Tensor,
++    gamma: float,
++    lam: float,
++    high_level_gamma: float,
++):
++    """Modified GAE calculation that compute two level of advantage and return:
++    high level: per-turn wise
++    low level: token wise
++    there're two level of MDP, where high level is the agentic MDP and low level is the token MDP
++    Args:
++        token_level_rewards: `(torch.Tensor)` (multi-turn reward, per turn reward is given at eos token for each response token sequence)
++            shape: (bs, response_length)
++        reward_mask: `(torch.Tensor)`
++            shape: (bs, response_length). 1 for reward position (end of each llm response)
++        values: `(torch.Tensor)`
++            shape: (bs, response_length)
++        loss_mask: `(torch.Tensor)`
++            shape: (bs, response_length). 1 for llm_raw_response, 0 for environment info and paddings
++        gamma: `(float)`
++            discounted factor used in RL for token rewards
++        high_level_gamma: `(float)`
++            discounted factor used in RL for per-turn reward
++        lam: `(float)`
++            lambda value when computing Generalized Advantage Estimation
++
++    Returns:
++        advantages: `(torch.Tensor)`
++            shape: (bs, response_length)
++        Returns: `(torch.Tensor)`
++            shape: (bs, response_length)
++    """
++
++    with torch.no_grad():
++        batch_size, gen_len = token_level_rewards.shape
++        advantages = torch.zeros_like(token_level_rewards)
++        returns = torch.zeros_like(token_level_rewards)
++        updated_reward = token_level_rewards.clone()
++
++        for b in range(batch_size):
++            # First, calculate high level advantage and return for eos token of each turn using high level gamma
++            eos_positions = reward_mask[b].nonzero(as_tuple=True)[0]
++            lastgaelam = 0.0
++            for i in range(len(eos_positions) - 1, -1, -1):
++                curr_pos = eos_positions[i]
++
++                # Get the next value
++                if i < len(eos_positions) - 1:
++                    # Next valid position
++                    next_pos = eos_positions[i + 1]
++                    nextvalue = values[b, next_pos]
++
++                else:
++                    # Last valid position
++                    nextvalue = 0.0
++
++                # Calculate delta using the next valid token
++                delta = (
++                    updated_reward[b, curr_pos]
++                    + high_level_gamma * nextvalue
++                    - values[b, curr_pos]
++                )
++
++                # Update advantage estimate
++                lastgaelam = delta + high_level_gamma * lam * lastgaelam
++                advantages[b, curr_pos] = lastgaelam
++
++            for i, pos in enumerate(eos_positions):
++                returns[b, pos] = advantages[b, pos] + values[b, pos]
++                updated_reward[b, pos] = advantages[b, pos] + values[b, pos]
++
++            # Then, calculate low level advantage and return for each token using gamma, assume the reward for the sequence now is the return at eos token
++            lastgaelam = 0.0
++            valid_positions = loss_mask[b].nonzero(as_tuple=True)[0]
++            for i in range(len(valid_positions) - 1, -1, -1):
++                curr_pos = valid_positions[i]
++                if i < len(valid_positions) - 1:
++                    # Next valid position
++                    next_pos = valid_positions[i + 1]
++                    nextvalue = values[b, next_pos]
++                else:
++                    # Last valid position
++                    nextvalue = 0.0
++                    lastgaelam = 0.0
++                delta = (
++                    updated_reward[b, curr_pos]
++                    + gamma * nextvalue
++                    - values[b, curr_pos]
++                )
++                lastgaelam = delta + gamma * lam * lastgaelam
++                advantages[b, curr_pos] = lastgaelam
++                returns[b, curr_pos] = lastgaelam + values[b, curr_pos]
++
++        advantages = verl_F.masked_whiten(advantages, loss_mask)
++
++    return advantages, returns
++def compute_bi_level_gae_advantage_mixture_return(
++    token_level_rewards: torch.Tensor,
++    reward_mask: torch.Tensor,
++    values: torch.Tensor,
++    loss_mask: torch.Tensor,
++    gamma: float,
++    lam: float,
++    alpha: float = 0.5,
++    low_level_lam: float = 1.0,
++    aggregate_reward_in_turn: bool = False,
++    whiten_advantage: bool = True,
++):
++    """Compute bi-level GAE with separate whitening, then mix.
++    * High-level (turn-wise): GAE computed at EOS tokens, then BROADCAST to all tokens of that turn (per loss_mask).
++    * Token-level (token-wise): standard GAE over valid tokens (per loss_mask).
++    Each level is whitened separately and then linearly combined by `alpha`.
++
++    Args:
++        token_level_rewards: (B, T) per-token reward. EOS tokens carry per-turn reward.
++        reward_mask: (B, T) 1 at EOS tokens (end of each response turn).
++        values: (B, T) value estimates for each token position.
++        loss_mask: (B, T) 1 at valid LLM token positions, 0 at padding/environment.
++        gamma: discount factor for token-level GAE.
++        lam: lambda for GAE.
++        high_level_gamma: discount factor for turn-level GAE (kept by design).
++        alpha: mixing weight for high-level vs. token-level advantage.
++
++    Returns:
++        advantages: (B, T) combined advantage after separate whitening.
++        returns:    (B, T) combined return after separate whitening.
++    """
++    with torch.no_grad():
++        B, T = token_level_rewards.shape
++
++        adv_high = torch.zeros_like(token_level_rewards)  # will be broadcast to turn tokens
++        ret_high = torch.zeros_like(token_level_rewards)  # will be broadcast to turn tokens
++        adv_tok  = torch.zeros_like(token_level_rewards)
++        ret_tok  = torch.zeros_like(token_level_rewards)
++
++        updated_reward = token_level_rewards.clone()
++
++        # ===== High-level GAE (computed at EOS, then broadcast to the entire turn) =====
++        for b in range(B):
++            eos_positions = reward_mask[b].nonzero(as_tuple=True)[0]
++            if eos_positions.numel() == 0:
++                continue
++
++            lastgaelam = 0.0
++            # First, compute GAE only at EOS positions (your original design preserved)
++            for i in range(len(eos_positions) - 1, -1, -1):
++                curr_pos = eos_positions[i]
++
++                # Value at next EOS (or 0.0 if this is the last turn)
++                if i < len(eos_positions) - 1:
++                    next_pos = eos_positions[i + 1]
++                    nextvalue = values[b, next_pos]
++                    # Accumulate token-scale discount across the current turn (kept as in your design)
++                    turn_len = get_current_turn_length(
++                        loss_mask=loss_mask, reward_mask=reward_mask,
++                        cur_position=next_pos, batch_idx=b,
++                    )
++                else:
++                    next_pos = curr_pos
++                    nextvalue = 0.0
++                    turn_len = 1
++
++                accum_gamma = gamma ** turn_len
++
++                # GAE delta at EOS (turn-level)
++                if aggregate_reward_in_turn and next_pos != curr_pos:
++                    # aggregate reward in from the current position to the end of the turn
++                    valid_positions_for_aggregate = loss_mask[b, curr_pos+1:next_pos].nonzero(as_tuple=True)[0] + curr_pos + 1
++
++                    reward = updated_reward[b, curr_pos].clone()
++                    factor = 1
++                    for pp in valid_positions_for_aggregate:
++                        reward += gamma ** factor * updated_reward[b, pp]
++                        factor += 1
++                else:
++                    reward = updated_reward[b, curr_pos]
++
++                # GAE delta at EOS (turn-level)
++                delta = (
++                    reward
++                    + accum_gamma * nextvalue
++                    - values[b, curr_pos]
++                )
++                lastgaelam = delta + accum_gamma * lam * lastgaelam
++
++
++                # Temporarily store only at EOS; we'll broadcast below
++                adv_high[b, curr_pos] = lastgaelam
++                ret_high[b, curr_pos] = lastgaelam + values[b, curr_pos]
++
++            # Now BROADCAST each EOS's turn-level value to all tokens in that turn.
++            # A "turn" is defined as tokens (loss_mask==1) between the previous EOS (exclusive)
++            # and the current EOS (inclusive).
++            for i, curr_pos in enumerate(eos_positions):
++                prev_eos = eos_positions[i - 1].item() if i > 0 else -1
++                # Valid token range for this turn is (prev_eos, curr_pos], but restricted by loss_mask
++                turn_slice = slice(prev_eos + 1, curr_pos + 1)
++                # Create a boolean mask for the tokens belonging to this turn
++                turn_token_mask = torch.zeros(T, dtype=torch.bool, device=loss_mask.device)
++                # Only broadcast to positions that are valid LLM tokens
++                turn_token_mask[turn_slice] = loss_mask[b, turn_slice].bool()
++
++                # Broadcast the EOS-computed advantage/return to all tokens of the turn
++                adv_val = adv_high[b, curr_pos].clone()
++                adv_high[b, turn_token_mask] = adv_val
++            for i, curr_pos in enumerate(eos_positions):
++                prev_eos = eos_positions[i - 1].item() if i > 0 else -1
++                # (prev_eos, curr_pos] 是这个 turn 的 token 区间
++                base_indices = torch.arange(
++                    prev_eos + 1,
++                    curr_pos + 1,
++                    device=loss_mask.device,
++                )
++
++                # 只保留 loss_mask==1 的 LLM token
++                turn_token_indices = base_indices[loss_mask[b, base_indices].bool()]
++                # 此时 ret_high[b, curr_pos] 已经包含了
++                #   r(curr_pos) + future_turns 的折扣回报
++                # 我们从倒数第二个 token 开始往前递推：
++                #   R_t = r_t + gamma * R_{t+1}
++                for k in range(turn_token_indices.numel() - 2, -1, -1):
++                    t = turn_token_indices[k]
++                    t_next = turn_token_indices[k + 1]
++                    ret_high[b, t] = (
++                        updated_reward[b, t]
++                        + gamma * ret_high[b, t_next]
++                    )
++
++
++        # ===== Token-level GAE (standard over valid positions) =====
++        for b in range(B):
++            valid_positions = loss_mask[b].nonzero(as_tuple=True)[0]
++            if valid_positions.numel() == 0:
++                continue
++            lastgaelam = 0.0
++            for i in range(len(valid_positions) - 1, -1, -1):
++                curr_pos = valid_positions[i]
++                if i != len(valid_positions) - 1:
++                    next_pos = valid_positions[i + 1]
++                    nextvalue = values[b, next_pos]
++                else:
++                    nextvalue = 0.0
++                    lastgaelam = 0.0
++
++                delta = (
++                    updated_reward[b, curr_pos]
++                    + gamma * nextvalue
++                    - values[b, curr_pos]
++                )
++                lastgaelam = delta + gamma * low_level_lam * lastgaelam
++
++                adv_tok[b, curr_pos] = lastgaelam
++                ret_tok[b, curr_pos] = lastgaelam + values[b, curr_pos]
++
++        # ===== Separate whitening for each level =====
++        # After broadcasting, high-level signals live on all turn tokens -> use loss_mask for whitening.
++        # adv_high = verl_F.masked_whiten(adv_high, loss_mask)   # previously reward_mask; now broadcast-aware
++        # adv_tok  = verl_F.masked_whiten(adv_tok,  loss_mask)
++
++        # ===== Mix the two signals =====
++        advantages = alpha * adv_high + (1.0 - alpha) * adv_tok
++        returns    = alpha * ret_high + (1.0 - alpha) * ret_tok
++        if whiten_advantage:
++            advantages = verl_F.masked_whiten(advantages, loss_mask)
++
++    return advantages, returns
++
++def compute_mixture_advantage_return_with_group_relative(
++    token_level_rewards: torch.Tensor,
++    reward_mask: torch.Tensor,
++    values: torch.Tensor,
++    loss_mask: torch.Tensor,
++    gamma: float,
++    lam: float,
++    alpha: float = 0.5,
++    low_level_lam: float = 1.0,
++    aggregate_reward_in_turn: bool = False,
++    index: torch.Tensor = None,
++    epsilon: float = 1e-6,
++):
++    """
++    Wrapper adding group-relative normalization based on `index`.
++    Assumes token_level_rewards has an extra feature dimension and sums over it.
++    """
++
++    id2score = defaultdict(list)
++    id2mean = {}
++    id2std = {}
++
++    with torch.no_grad():
++        advantages, returns = compute_bi_level_gae_advantage_mixture_return(
++            token_level_rewards=token_level_rewards,
++            reward_mask=reward_mask,
++            values=values,
++            loss_mask=loss_mask,
++            gamma=gamma,
++            lam=lam,
++            alpha=alpha,
++            low_level_lam=low_level_lam,
++            aggregate_reward_in_turn=aggregate_reward_in_turn,
++            whiten_advantage=False,
++        )
++        bsz = advantages.shape[0]
++
++        # collect per-group scalar score (here we just sum over time)
++        for i in range(bsz):
++            id2score[index[i]].append(advantages[i].sum())
++
++        for idx in id2score:
++            if len(id2score[idx]) == 1:
++                id2mean[idx] = torch.tensor(0.0)
++                id2std[idx] = torch.tensor(1.0)
++            elif len(id2score[idx]) > 1:
++                vals = torch.tensor(id2score[idx])
++                id2mean[idx] = torch.mean(vals)
++                id2std[idx] = torch.std(vals)
++            else:
++                raise ValueError(f"no score in prompt index: {idx}")
++
++        # group-relative normalization
++        for i in range(bsz):
++            grp = index[i]
++            advantages[i] = (
++                advantages[i] - id2mean[grp]
++            ) / (id2std[grp] + epsilon)
++
++    return advantages, returns
++
++
++
++
++
++
++def compute_turn_wise_gae_advantage_return(
++    token_level_rewards: torch.Tensor,
++    reward_mask: torch.Tensor,
++    values: torch.Tensor,
++    loss_mask: torch.Tensor,
++    lam: float,
++    high_level_gamma: float,
++):
++    """Modified GAE calculation that compute two level of advantage and return:
++    high level: per-turn wise
++    low level: token wise
++    there're two level of MDP, where high level is the agentic MDP and low level is the token MDP
++    Args:
++        token_level_rewards: `(torch.Tensor)` (multi-turn reward, per turn reward is given at eos token for each response token sequence)
++            shape: (bs, response_length)
++        reward_mask: `(torch.Tensor)`
++            shape: (bs, response_length). 1 for reward position (end of each llm response)
++        values: `(torch.Tensor)`
++            shape: (bs, response_length)
++        loss_mask: `(torch.Tensor)`
++            shape: (bs, response_length). 1 for llm_raw_response, 0 for environment info and paddings
++        high_level_gamma: `(float)`
++            discounted factor used in RL for per-turn reward
++        lam: `(float)`
++            lambda value when computing Generalized Advantage Estimation
++
++    Returns:
++        advantages: `(torch.Tensor)`
++            shape: (bs, response_length)
++        Returns: `(torch.Tensor)`
++            shape: (bs, response_length)
++    """
++    with torch.no_grad():
++        batch_size, gen_len = token_level_rewards.shape
++        advantages = torch.zeros_like(token_level_rewards)
++        returns = torch.zeros_like(token_level_rewards)
++
++        for b in range(batch_size):
++            # First, calculate high level advantage and return for eos token of each turn using high level gamma
++            eos_positions = reward_mask[b].nonzero(as_tuple=True)[0]
++            lastgaelam = 0.0
++            for i in range(len(eos_positions) - 1, -1, -1):
++                curr_pos = eos_positions[i]
++
++                # Get the next value
++                if i < len(eos_positions) - 1:
++                    # Next valid position
++                    next_pos = eos_positions[i + 1]
++                    nextvalue = values[b, next_pos]
++
++                else:
++                    # Last valid position
++                    nextvalue = 0.0
++
++                # Calculate delta using the next valid token
++                delta = (
++                    token_level_rewards[b, curr_pos]
++                    + high_level_gamma * nextvalue
++                    - values[b, curr_pos]
++                )
++
++                # Update advantage estimate
++                lastgaelam = delta + high_level_gamma * lam * lastgaelam
++                advantages[b, curr_pos] = lastgaelam
++
++            for i, pos in enumerate(eos_positions):
++                returns[b, pos] = advantages[b, pos] + values[b, pos]
++
++            # each token in the sequence has the same advantage
++            cur_adv = 0.0
++            valid_positions = loss_mask[b].nonzero(as_tuple=True)[0]
++            for i in range(len(valid_positions) - 1, -1, -1):
++                curr_pos = valid_positions[i]
++                if curr_pos not in eos_positions:
++                    # Next valid position
++                    advantages[b, curr_pos] = cur_adv
++                else:
++                    # Last valid position
++                    cur_adv = advantages[b, curr_pos]
++
++        advantages = verl_F.masked_whiten(advantages, reward_mask)
++
++    return advantages, returns
++
++
++def compute_gae_advantage_return(
++    token_level_rewards: torch.Tensor,
++    values: torch.Tensor,
++    eos_mask: torch.Tensor,
++    gamma: torch.Tensor,
++    lam: torch.Tensor,
++):
+     """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py
+ 
+     Args:
+@@ -97,9 +840,11 @@ def compute_gae_advantage_return(token_level_rewards: torch.Tensor, values: torc
+ 
+         for t in reversed(range(gen_len)):
+             nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
+-            delta = token_level_rewards[:, t] + gamma * nextvalues - values[:, t]
+-            lastgaelam = delta + gamma * lam * lastgaelam
+-            advantages_reversed.append(lastgaelam)
++            delta = (
++                token_level_rewards[:, t] + gamma * nextvalues - values[:, t]
++            )  # TD error
++            lastgaelam = delta + gamma * lam * lastgaelam  # gae
++            advantages_reversed.append(lastgaelam)  # store the gae
+         advantages = torch.stack(advantages_reversed[::-1], dim=1)
+ 
+         returns = advantages + values
+@@ -108,19 +853,21 @@ def compute_gae_advantage_return(token_level_rewards: torch.Tensor, values: torc
+ 
+ 
+ # NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
+-def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
+-                                   eos_mask: torch.Tensor,
+-                                   index: torch.Tensor,
+-                                   epsilon: float = 1e-6):
++def compute_grpo_outcome_advantage(
++    token_level_rewards: torch.Tensor,
++    eos_mask: torch.Tensor,
++    index: torch.Tensor,
++    epsilon: float = 1e-6,
++):
+     """
+-    Compute advantage for GRPO, operating only on Outcome reward 
++    Compute advantage for GRPO, operating only on Outcome reward
+     (with only one scalar reward for each response).
+     Args:
+         token_level_rewards: `(torch.Tensor)`
+             shape: (bs, response_length)
+         eos_mask: `(torch.Tensor)`
+             shape: (bs, response_length)
+-    
++
+     Returns:
+         advantages: `(torch.Tensor)`
+             shape: (bs, response_length)
+@@ -154,10 +901,12 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
+     return scores, scores
+ 
+ 
+-def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
+-                                   eos_mask: torch.Tensor,
+-                                   index: torch.Tensor,
+-                                   epsilon: float = 1e-6):
++def compute_rloo_outcome_advantage(
++    token_level_rewards: torch.Tensor,
++    eos_mask: torch.Tensor,
++    index: torch.Tensor,
++    epsilon: float = 1e-6,
++):
+     """
+     Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
+     Args:
+@@ -192,24 +941,63 @@ def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
+         for i in range(bsz):
+             response_num = len(id2score[index[i]])
+             if response_num > 1:
+-                scores[i] = scores[i] * response_num / (response_num -
+-                                                        1) - id2mean[index[i]] * response_num / (response_num - 1)
++                scores[i] = scores[i] * response_num / (response_num - 1) - id2mean[
++                    index[i]
++                ] * response_num / (response_num - 1)
+         scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
+ 
+     return scores, scores
+ 
+-
+-def compute_reinforce_plus_plus_outcome_advantage(token_level_rewards: torch.Tensor, eos_mask: torch.Tensor,
+-                                                  gamma: torch.Tensor):
++def compute_masked_reinforce_advantage(
++    token_level_rewards: torch.Tensor,
++    loss_mask: torch.Tensor,
++    gamma: torch.Tensor,
++):
++    """
++    Compute advantage for masked REINFORCE.
++    Args:
++        token_level_rewards: `(torch.Tensor)`
++            shape: (bs, response_length)
++        loss_mask: `(torch.Tensor)`
++        gamma: `(torch.Tensor)`
++            shape: (bs, response_length)
++    Returns:
++        advantages: `(torch.Tensor)`
++            shape: (bs, response_length)
++        Returns: `(torch.Tensor)`
++            shape: (bs, response_length)
+     """
+-    Compute advantage for REINFORCE++. 
++    with torch.no_grad():
++        batch_size, gen_len = token_level_rewards.shape
++        advantages = torch.zeros_like(token_level_rewards)
++        for b in range(batch_size):
++            running_return = 0
++            # Find the valid token positions (where loss_mask is 1)
++            valid_positions = (loss_mask[b] == 1).nonzero(as_tuple=True)[0]
++
++            if len(valid_positions) == 0:
++                continue
++
++            for i in range(len(valid_positions) - 1, -1, -1):
++                curr_pos = valid_positions[i]
++                running_return = token_level_rewards[b, curr_pos] + gamma * running_return
++                advantages[b, curr_pos] = running_return
++        advantages = verl_F.masked_whiten(advantages, loss_mask)
++    return advantages, torch.zeros_like(token_level_rewards)
++
++
++def compute_reinforce_plus_plus_outcome_advantage(
++    token_level_rewards: torch.Tensor, eos_mask: torch.Tensor, gamma: torch.Tensor
++):
++    """
++    Compute advantage for REINFORCE++.
+     This implementation is based on the paper: https://arxiv.org/abs/2501.03262
+     Args:
+         token_level_rewards: `(torch.Tensor)`
+             shape: (bs, response_length)
+         eos_mask: `(torch.Tensor)`
+             shape: (bs, response_length)
+-    
++
+     Returns:
+         advantages: `(torch.Tensor)`
+             shape: (bs, response_length)
+@@ -233,10 +1021,13 @@ def compute_reinforce_plus_plus_outcome_advantage(token_level_rewards: torch.Ten
+     return advantages, returns
+ 
+ 
+-def compute_remax_outcome_advantage(token_level_rewards: torch.Tensor, reward_baselines: torch.Tensor,
+-                                    eos_mask: torch.Tensor):
++def compute_remax_outcome_advantage(
++    token_level_rewards: torch.Tensor,
++    reward_baselines: torch.Tensor,
++    eos_mask: torch.Tensor,
++):
+     """
+-    Compute advantage for ReMax, operating only on Outcome reward 
++    Compute advantage for ReMax, operating only on Outcome reward
+     This implementation is based on the paper: https://arxiv.org/abs/2310.10505
+ 
+     (with only one scalar reward for each response).
+@@ -247,7 +1038,7 @@ def compute_remax_outcome_advantage(token_level_rewards: torch.Tensor, reward_ba
+             shape: (bs,)
+         eos_mask: `(torch.Tensor)`
+             shape: (bs, response_length)
+-    
++
+     Returns:
+         advantages: `(torch.Tensor)`
+             shape: (bs, response_length)
+@@ -258,8 +1049,16 @@ def compute_remax_outcome_advantage(token_level_rewards: torch.Tensor, reward_ba
+     scores = token_level_rewards.sum(dim=-1)
+ 
+     with torch.no_grad():
+-        returns = (token_level_rewards * eos_mask).flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
+-        advantages = returns - reward_baselines.unsqueeze(-1).tile([1, response_length]) * eos_mask
++        returns = (
++            (token_level_rewards * eos_mask)
++            .flip(dims=[-1])
++            .cumsum(dim=-1)
++            .flip(dims=[-1])
++        )
++        advantages = (
++            returns
++            - reward_baselines.unsqueeze(-1).tile([1, response_length]) * eos_mask
++        )
+ 
+     return advantages, returns
+ 
+@@ -269,7 +1068,14 @@ def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
+     return token_level_scores - kl * kl_ratio
+ 
+ 
+-def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange):
++def compute_policy_loss(
++    old_log_prob,
++    log_prob,
++    advantages,
++    eos_mask,
++    cliprange,
++    clip_ratio_c=3.0,
++):
+     """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
+ 
+     Args:
+@@ -283,6 +1089,9 @@ def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange)
+             shape: (bs, response_length)
+         cliprange: (float)
+             The clip range used in PPO. See https://arxiv.org/abs/1707.06347
++        clip_ratio_c: (float)
++            The upper bound on the importance ratio for negative advantages in
++            Dual-Clip PPO. See https://arxiv.org/abs/1912.09729.
+ 
+     Returns:
+         pg_loss: `a scalar torch.Tensor`
+@@ -291,15 +1100,73 @@ def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange)
+             a float number indicating the fraction of policy gradient loss being clipped
+ 
+     """
++    assert clip_ratio_c > 1.0, "clip_ratio_c must be greater than 1.0"
++
+     negative_approx_kl = log_prob - old_log_prob
+     ratio = torch.exp(negative_approx_kl)
+     ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
+ 
+-    pg_losses = -advantages * ratio
++    pg_losses1 = -advantages * ratio
+     pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+ 
+-    pg_loss = verl_F.masked_mean(torch.max(pg_losses, pg_losses2), eos_mask)
+-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses).float(), eos_mask)
++    clipped_pg_losses = torch.max(pg_losses1, pg_losses2)
++    dual_clipped_pg_losses = torch.min(-advantages * clip_ratio_c, clipped_pg_losses)
++    pg_losses = torch.where(advantages < 0, dual_clipped_pg_losses, clipped_pg_losses)
++
++    pg_loss = verl_F.masked_mean(pg_losses, eos_mask)
++    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), eos_mask)
++    return pg_loss, pg_clipfrac, ppo_kl
++
++
++def compute_rl4vlm_policy_loss(
++    old_log_prob,
++    log_prob,
++    advantages,
++    loss_mask,
++    reward_mask,
++    think_mask,
++    cliprange,
++    thought_prob_coef,
++):
++    """Compute RL4VLM's turn-level PPO ratio and clipped objective."""
++
++    device = old_log_prob.device
++    token_coef = torch.where(think_mask.bool(), thought_prob_coef, 1.0).to(device)
++    token_coef = token_coef * loss_mask
++    weighted_old = old_log_prob * token_coef
++    weighted_new = log_prob * token_coef
++
++    surrogate_1 = []
++    surrogate_2 = []
++    negative_kls = []
++    for batch_idx in range(old_log_prob.shape[0]):
++        eos_positions = reward_mask[batch_idx].nonzero(as_tuple=True)[0]
++        for turn_idx, eos_pos in enumerate(eos_positions):
++            start = 0 if turn_idx == 0 else eos_positions[turn_idx - 1].item() + 1
++            turn_slice = slice(start, eos_pos.item() + 1)
++            negative_kl = (
++                weighted_new[batch_idx, turn_slice].sum()
++                - weighted_old[batch_idx, turn_slice].sum()
++            )
++            ratio = torch.exp(negative_kl)
++            advantage = advantages[batch_idx, eos_pos]
++            surrogate_1.append(-advantage * ratio)
++            surrogate_2.append(
++                -advantage
++                * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
++            )
++            negative_kls.append(negative_kl)
++
++    if not surrogate_1:
++        zero = old_log_prob.sum() * 0.0
++        return zero, zero.detach(), zero.detach()
++
++    surrogate_1 = torch.stack(surrogate_1)
++    surrogate_2 = torch.stack(surrogate_2)
++    negative_kls = torch.stack(negative_kls)
++    pg_loss = torch.max(surrogate_1, surrogate_2).mean()
++    pg_clipfrac = torch.gt(surrogate_2, surrogate_1).float().mean()
++    ppo_kl = -negative_kls.mean()
+     return pg_loss, pg_clipfrac, ppo_kl
+ 
+ 
+@@ -340,15 +1207,19 @@ def compute_value_loss(vpreds, returns, values, eos_mask, cliprange_value):
+             The ratio of vf being clipped
+ 
+     """
+-    vpredclipped = verl_F.clip_by_value(vpreds, values - cliprange_value, values + cliprange_value)
+-    vf_losses1 = (vpreds - returns)**2
+-    vf_losses2 = (vpredclipped - returns)**2
++    vpredclipped = verl_F.clip_by_value(
++        vpreds, values - cliprange_value, values + cliprange_value
++    )
++    vf_losses1 = (vpreds - returns) ** 2
++    vf_losses2 = (vpredclipped - returns) ** 2
+     vf_loss = 0.5 * verl_F.masked_mean(torch.max(vf_losses1, vf_losses2), eos_mask)
+     vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), eos_mask)
+     return vf_loss, vf_clipfrac
+ 
+ 
+-def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
++def kl_penalty(
++    logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty
++) -> torch.FloatTensor:
+     """Compute KL divergence given logprob and ref_logprob.
+     Copied from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1104
+ 
+@@ -370,7 +1241,7 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
+ 
+     # J. Schulman. Approximating kl divergence, 2020.
+     # # URL http://joschu.net/blog/kl-approx.html.
+-    if kl_penalty == 'low_var_kl':
++    if kl_penalty == "low_var_kl":
+         kl = ref_logprob - logprob
+         ratio = torch.exp(kl)
+         kld = (ratio - kl - 1).contiguous()
+diff --git a/verl/utils/checkpoint/fsdp_checkpoint_manager.py b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+index 8b3f09ae2f002cb5cd8094c26818f3c9bebacf0a..6fd476b30fcc17d05af7c4601469af7637258d44 100644
+--- a/verl/utils/checkpoint/fsdp_checkpoint_manager.py
++++ b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+@@ -38,7 +38,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+     - extra_states
+     in a SPMD way.
+ 
+-    We save 
++    We save
+     - sharded model states and optimizer states
+     - full lr_scheduler states
+     - huggingface tokenizer/processor and config for ckpt merge
+@@ -73,9 +73,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+         local_optim_path = copy_to_local(remote_optim_path)
+         local_extra_state_path = copy_to_local(remote_extra_state_path)
+ 
+-        model_state_dict = torch.load(local_model_path)
+-        optimizer_state_dict = torch.load(local_optim_path)
+-        extra_state_dict = torch.load(local_extra_state_path)
++        # These are trusted, locally generated training checkpoints. Optimizer
++        # state contains OmegaConf objects and RNG state contains NumPy objects,
++        # so PyTorch 2.6's new weights_only=True default cannot deserialize the
++        # existing VERL checkpoint format.
++        model_state_dict = torch.load(local_model_path, weights_only=False)
++        optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
++        extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
+ 
+         if del_local_after_load:
+             try:
+diff --git a/verl/utils/seed.py b/verl/utils/seed.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c7f900772c914a42c11b482e098f6eeeeabbd9ce
+--- /dev/null
++++ b/verl/utils/seed.py
+@@ -0,0 +1,44 @@
++
++from __future__ import annotations
++
++import os
++import random
++from typing import Optional
++
++import numpy as np
++import torch
++
++__all__ = ["seed_everything"]
++
++
++def seed_everything(seed: int, *, deterministic: bool = True, warn: bool = True) -> None:
++    """Seed *all* common PRNGs to make experiment deterministic.
++
++    Parameters
++    ----------
++    seed : int
++        The random seed to set.
++    deterministic : bool, default True
++        If *True* will apply extra flags to make cuDNN deterministic
++        (slower but reproducible).  Can be disabled if performance is
++        preferred over bit-wise reproducibility.
++    warn : bool, default True
++        If *True* prints a short message when called multiple times.
++    """
++    # Prevent accidental reseeding in the same process unless user opts out.
++    if hasattr(seed_everything, "_seeded") and seed_everything._seeded and warn:
++        print("[seed_everything] WARNING: reseeding the same Python process.")
++
++    os.environ["PYTHONHASHSEED"] = str(seed)
++
++    random.seed(seed)
++    np.random.seed(seed)
++    torch.manual_seed(seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(seed)
++
++    if deterministic:
++        torch.backends.cudnn.deterministic = True
++        torch.backends.cudnn.benchmark = False
++
++    seed_everything._seeded = True  # type: ignore[attr-defined]
+diff --git a/verl/utils/value_head_init.py b/verl/utils/value_head_init.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5dea396525f94fbbdd403d75e700833c4208bb75
+--- /dev/null
++++ b/verl/utils/value_head_init.py
+@@ -0,0 +1,86 @@
++"""Deterministic normal initialization for PPO critic value heads."""
++
++from __future__ import annotations
++
++import hashlib
++import math
++from typing import Any
++
++import torch
++from torch import nn
++
++
++VALUE_HEAD_INIT_SEED = 42
++DEFAULT_VALUE_HEAD_INIT_STD = 2.0e-3
++
++
++def _find_value_head(model: nn.Module) -> tuple[str, nn.Linear]:
++    score = getattr(model, "score", None)
++    if isinstance(score, nn.Linear):
++        return "score", score
++
++    value_head = getattr(model, "v_head", None)
++    if isinstance(value_head, nn.Linear):
++        return "v_head", value_head
++    summary = getattr(value_head, "summary", None)
++    if isinstance(summary, nn.Linear):
++        return "v_head.summary", summary
++
++    raise ValueError(
++        "critic model does not expose a supported linear value head "
++        "(expected score, v_head, or v_head.summary)"
++    )
++
++
++def _tensor_sha256(tensor: torch.Tensor | None) -> str | None:
++    if tensor is None:
++        return None
++    value = tensor.detach().cpu().contiguous().view(torch.uint8)
++    return hashlib.sha256(value.numpy().tobytes()).hexdigest()
++
++
++def initialize_value_head(
++    model: nn.Module,
++    std: float = DEFAULT_VALUE_HEAD_INIT_STD,
++) -> dict[str, Any]:
++    """Initialize the critic head with N(0, ``std``) and zero bias.
++
++    A private generator with a fixed seed is used so initialization is
++    reproducible without consuming or reseeding the process-global RNG.
++    """
++
++    std = float(std)
++    if not math.isfinite(std) or std <= 0:
++        raise ValueError("value-head init std must be finite and positive")
++
++    name, head = _find_value_head(model)
++    if head.weight.is_meta:
++        raise ValueError(
++            "value-head initialization must run after materialization and before FSDP wrapping"
++        )
++
++    generator = torch.Generator(device=head.weight.device)
++    generator.manual_seed(VALUE_HEAD_INIT_SEED)
++    with torch.no_grad():
++        nn.init.normal_(head.weight, mean=0.0, std=std, generator=generator)
++        if head.bias is not None:
++            nn.init.zeros_(head.bias)
++
++    weight = head.weight.detach().float()
++    bias = head.bias.detach().float() if head.bias is not None else None
++    return {
++        "initializer": "normal",
++        "head": name,
++        "std": std,
++        "seed": VALUE_HEAD_INIT_SEED,
++        "weight_shape": list(head.weight.shape),
++        "weight_dtype": str(head.weight.dtype),
++        "weight_device": str(head.weight.device),
++        "weight_mean": weight.mean().item(),
++        "weight_std": weight.std(unbiased=False).item(),
++        "weight_l2": torch.linalg.vector_norm(weight).item(),
++        "weight_sha256": _tensor_sha256(head.weight),
++        "bias_mean": bias.mean().item() if bias is not None else None,
++        "bias_std": bias.std(unbiased=False).item() if bias is not None else None,
++        "bias_sha256": _tensor_sha256(head.bias),
++    }
+diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
+index 34337b5428b82ce3a270be6c7ee0bd8fe5a70116..004e9d9f5c0eaa85ee857ba42a4e9ea87b6456d5 100644
+--- a/verl/workers/actor/dp_actor.py
++++ b/verl/workers/actor/dp_actor.py
+@@ -32,6 +32,7 @@ from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
+ import verl.utils.torch_functional as verl_F
+ 
+ from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
++from verl.utils.seed import seed_everything
+ 
+ __all__ = ['DataParallelPPOActor']
+ 
+@@ -54,10 +55,12 @@ class DataParallelPPOActor(BasePPOActor):
+         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+ 
+         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
++        seed=self.config.get('seed', 42)
++        seed_everything(seed)
+ 
+     def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
+         """
+-        Returns: 
++        Returns:
+             entropy: # (bs, response_len)
+             log_probs: # (bs, response_len)
+         """
+@@ -158,11 +161,21 @@ class DataParallelPPOActor(BasePPOActor):
+     def _optimizer_step(self):
+         assert self.config.grad_clip is not None
+ 
++        # Calculate gradient norm
+         if isinstance(self.actor_module, FSDP):
+             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
+         else:
+             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+-        self.actor_optimizer.step()
++
++
++        grad_norm_threshold = self.config.grad_norm_threshold
++
++        # Only update if grad_norm is below threshold
++        if not torch.isfinite(grad_norm) or (grad_norm_threshold is not None and grad_norm >= grad_norm_threshold):
++            # Skip the update
++            self.actor_optimizer.zero_grad()
++        else:
++            self.actor_optimizer.step()
+         return grad_norm
+ 
+     def compute_log_prob(self, data: DataProto) -> torch.Tensor:
+@@ -229,7 +242,16 @@ class DataParallelPPOActor(BasePPOActor):
+ 
+         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
+ 
+-        select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
++        if 'loss_mask' in data.batch.keys():
++            select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages','loss_mask']
++        else:
++            select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
++        use_rl4vlm_loss = (
++            'think_mask' in data.batch.keys()
++            and 'reward_mask' in data.batch.keys()
++        )
++        if use_rl4vlm_loss:
++            select_keys.extend(['think_mask', 'reward_mask', 'thought_prob_coef'])
+         if self.config.use_kl_loss:
+             select_keys.append('ref_log_prob')
+         batch = data.select(batch_keys=select_keys).batch
+@@ -271,22 +293,52 @@ class DataParallelPPOActor(BasePPOActor):
+                         data = data.to(torch.cuda.current_device())  # actor device is cpu when using offload
+                     responses = data['responses']
+                     response_length = responses.size(1)
+-                    attention_mask = data['attention_mask']
+-                    response_mask = attention_mask[:, -response_length:]
++                    #attention_mask = data['attention_mask']
++
++                    # Note:
++                    # In agent setting, the prompt is the initial obs, and reponse is the whole trajectory except initial obs
++                    # The loss mask has the same shape of attention mask, which has both prompt and response, it masks:
++                    # the prompt, the padding of response (right padded), and the obs given by the environment in the reponse
++
++                    if "loss_mask" in data:
++                        loss_mask = data['loss_mask']
++                    else:
++                        print("DEBUG: warning, loss_mask not found in actor update")
++                        loss_mask=data["attention_mask"]
++                    response_mask = loss_mask[:, -response_length:]
+                     old_log_prob = data['old_log_probs']
+                     advantages = data['advantages']
+ 
+                     clip_ratio = self.config.clip_ratio
++                    clip_ratio_c = self.config.get('clip_ratio_c', 3.0)
+                     entropy_coeff = self.config.entropy_coeff
+ 
+                     # all return: (bsz, response_length)
+                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+ 
+-                    pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
+-                                                                                  log_prob=log_prob,
+-                                                                                  advantages=advantages,
+-                                                                                  eos_mask=response_mask,
+-                                                                                  cliprange=clip_ratio)
++                    if use_rl4vlm_loss:
++                        think_mask = data['think_mask'][:, -response_length:]
++                        reward_mask = data['reward_mask'][:, -response_length:]
++                        thought_prob_coef = data['thought_prob_coef'][0, 0].item()
++                        pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_rl4vlm_policy_loss(
++                            old_log_prob=old_log_prob,
++                            log_prob=log_prob,
++                            advantages=advantages,
++                            loss_mask=response_mask,
++                            reward_mask=reward_mask,
++                            think_mask=think_mask,
++                            cliprange=clip_ratio,
++                            thought_prob_coef=thought_prob_coef,
++                        )
++                    else:
++                        pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
++                            old_log_prob=old_log_prob,
++                            log_prob=log_prob,
++                            advantages=advantages,
++                            eos_mask=response_mask,
++                            cliprange=clip_ratio,
++                            clip_ratio_c=clip_ratio_c,
++                        )
+                     # compute entropy loss from entropy
+                     entropy_loss = verl_F.masked_mean(entropy, response_mask)
+ 
+diff --git a/verl/workers/critic/dp_critic.py b/verl/workers/critic/dp_critic.py
+index 68473363371cc887ece963a851e70e897c583dc6..04dbbbcbb17e558db1506f16668ab4c02742f4fb 100644
+--- a/verl/workers/critic/dp_critic.py
++++ b/verl/workers/critic/dp_critic.py
+@@ -32,6 +32,7 @@ from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_u
+ from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
+ 
+ from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
++from verl.utils.seed import seed_everything
+ 
+ __all__ = ['DataParallelPPOCritic']
+ 
+@@ -46,6 +47,8 @@ class DataParallelPPOCritic(BasePPOCritic):
+         print(f'Critic use_remove_padding={self.use_remove_padding}')
+ 
+         self.ulysses_sequence_parallel_size = self.config.get('ulysses_sequence_parallel_size', 1)
++        seed=self.config.get('seed', 42)
++        seed_everything(seed)
+ 
+     def _forward_micro_batch(self, micro_batch):
+         response_length = micro_batch['responses'].size(-1)
+@@ -168,7 +171,12 @@ class DataParallelPPOCritic(BasePPOCritic):
+         self.critic_module.train()
+         metrics = {}
+ 
+-        select_keys = ['input_ids', 'responses', 'attention_mask', 'position_ids', 'values', 'returns']
++        if self.config.use_reward_mask:
++            select_keys = ['input_ids', 'responses', 'attention_mask', 'position_ids', 'values', 'returns','end_of_response_position_mask']
++        elif 'loss_mask' in data.batch.keys():
++            select_keys = ['input_ids', 'responses', 'attention_mask', 'position_ids', 'values', 'returns','loss_mask']
++        else:
++            select_keys = ['input_ids', 'responses', 'attention_mask', 'position_ids', 'values', 'returns']
+         batch = data.select(batch_keys=select_keys).batch
+         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
+ 
+@@ -188,6 +196,7 @@ class DataParallelPPOCritic(BasePPOCritic):
+                 if has_multi_modal_inputs:
+                     num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+                     micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
++                    self.gradient_accumulation=num_micro_batches
+                 elif self.config.use_dynamic_bsz:
+                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                     micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+@@ -211,7 +220,17 @@ class DataParallelPPOCritic(BasePPOCritic):
+                     returns = data['returns']
+                     response_length = responses.size(1)
+ 
+-                    eos_mask = attention_mask[:, -response_length - 1:-1]
++                    # Use [:, -response_length:] if we have loss mask, use [:, -response_length - 1:-1] for attention mask as original implementation
++                    # TODO: check why we need [-response_length - 1:-1] while in actor it's [-response_length:]
++                    if self.config.use_reward_mask:
++                        loss_mask = data['end_of_response_position_mask'][:, -response_length:]
++                    elif "loss_mask" in data:
++                        loss_mask = data['loss_mask'][:, -response_length:]
++                    else:
++                        print("DEBUG: warning, loss_mask not found in critic update")
++                        loss_mask=data["attention_mask"][:, -response_length - 1:-1]
++
++                    eos_mask = loss_mask
+ 
+                     vpreds = self._forward_micro_batch(data)
+ 
+diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
+index 76da4e6ddd6d86e33c680a913bbf35b7bf7a7fc8..29f0f4f803f206bd8e6be69d1b5ab3534a5c450b 100644
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -690,15 +690,32 @@ class CriticWorker(Worker):
+             warnings.simplefilter("ignore")
+             setattr(critic_model_config, 'classifier_dropout', 0.)
+             setattr(critic_model_config, 'hidden_dropout', '0')
+-            critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
++            if "Qwen2.5-VL" in local_path:
++                from verl.models.transformers.modeling_qwen_2_5_vl_patch import Qwen2_5_VLForTokenClassification
++                critic_module = Qwen2_5_VLForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
+                                                                             torch_dtype=torch_dtype,
+                                                                             config=critic_model_config,
+                                                                             attn_implementation='flash_attention_2',
+                                                                             trust_remote_code=trust_remote_code)
++            else:
++                critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
++                                                                                torch_dtype=torch_dtype,
++                                                                                config=critic_model_config,
++                                                                                attn_implementation='flash_attention_2',
++                                                                                trust_remote_code=trust_remote_code)
+ 
+             # some parameters may not in torch_dtype
+             critic_module.to(torch_dtype)
+ 
++            from verl.utils.value_head_init import initialize_value_head
++            value_head_init_stats = initialize_value_head(
++                critic_module,
++                std=config.model.get('value_head_init_std', 2.0e-3),
++            )
++            if self.rank == 0:
++                import json
++                print(f"CRITIC_VALUE_HEAD_INIT {json.dumps(value_head_init_stats, sort_keys=True)}")
++
+             if config.model.get('enable_gradient_checkpointing', False):
+                 critic_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+         if self.rank == 0:
+diff --git a/verl/workers/rollout/vllm_rollout/__init__.py b/verl/workers/rollout/vllm_rollout/__init__.py
+index 0d6d4c3d818b73e33a9403bc698c917fbe8aaef3..58883637e72efe3c47a4ca8560136c11230e56fe 100644
+--- a/verl/workers/rollout/vllm_rollout/__init__.py
++++ b/verl/workers/rollout/vllm_rollout/__init__.py
+@@ -41,10 +41,10 @@ else:
+     package_version = get_version(package_name)
+ ###
+ 
+-if package_version <= '0.6.3':
+-    vllm_mode = 'customized'
+-    from .vllm_rollout import vLLMRollout
+-    from .fire_vllm_rollout import FIREvLLMRollout
+-else:
+-    vllm_mode = 'spmd'
+-    from .vllm_rollout_spmd import vLLMRollout
++# if package_version <= '0.6.3':
++#     vllm_mode = 'customized'
++#     from .vllm_rollout import vLLMRollout
++#     from .fire_vllm_rollout import FIREvLLMRollout
++# else:
++vllm_mode = 'spmd'
++from .vllm_rollout_spmd import vLLMRollout
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index df52f0786ccf3b2d49361e3277659df02dfc330e..11715cb883e53b8f170df76ef788d685a2a078b2 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -44,7 +44,7 @@ from verl.third_party.vllm import vllm_version
+ # 1. support pp in vllm
+ # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
+ # 3. simplify init logics
+-
++from verl.utils.seed import seed_everything
+ 
+ # NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
+ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
+@@ -76,6 +76,8 @@ class vLLMRollout(BaseRollout):
+         """
+         super().__init__()
+         self.config = config
++        seed=self.config.get('seed', 42)
++        seed_everything(seed)
+         assert not (not config.enforce_eager and config.free_cache_engine), \
+             "disable CUDA graph (enforce_eager = False) if free cache engine"
+ 
+@@ -97,22 +99,45 @@ class vLLMRollout(BaseRollout):
+         assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
+             "model context length should be greater than total sequence length"
+ 
+-        self.inference_engine = LLM(
+-            model=model_path,
+-            enable_sleep_mode=True,
+-            tensor_parallel_size=tensor_parallel_size,
+-            distributed_executor_backend="external_launcher",
+-            dtype=config.dtype,
+-            enforce_eager=config.enforce_eager,
+-            gpu_memory_utilization=config.gpu_memory_utilization,
+-            disable_custom_all_reduce=True,
+-            skip_tokenizer_init=False,
+-            max_model_len=config.prompt_length + config.response_length,
+-            disable_log_stats=config.disable_log_stats,
+-            max_num_batched_tokens=max_num_batched_tokens,
+-            enable_chunked_prefill=config.enable_chunked_prefill,
+-            enable_prefix_caching=True,
+-        )
++        max_model_len=config.get("max_trajectory_length",config.prompt_length + config.response_length)
++        # if model is qwenvl
++        if "Qwen2.5-VL" in model_path:
++            self.inference_engine = LLM(
++                model=model_path,
++                enable_sleep_mode=True,
++                tensor_parallel_size=tensor_parallel_size,
++                distributed_executor_backend="external_launcher",
++                dtype=config.dtype,
++                enforce_eager=config.enforce_eager,
++                gpu_memory_utilization=config.gpu_memory_utilization,
++                disable_custom_all_reduce=True,
++                skip_tokenizer_init=False,
++                max_model_len=max_model_len,
++                disable_log_stats=config.disable_log_stats,
++                max_num_batched_tokens=max_num_batched_tokens,
++                enable_chunked_prefill=config.enable_chunked_prefill,
++                enable_prefix_caching=True,
++                limit_mm_per_prompt={"image":config.limit_mm_per_prompt},
++                seed=config.get("seed", 0),
++            )
++        else:
++            self.inference_engine = LLM(
++                model=model_path,
++                enable_sleep_mode=True,
++                tensor_parallel_size=tensor_parallel_size,
++                distributed_executor_backend="external_launcher",
++                dtype=config.dtype,
++                enforce_eager=config.enforce_eager,
++                gpu_memory_utilization=config.gpu_memory_utilization,
++                disable_custom_all_reduce=True,
++                skip_tokenizer_init=False,
++                max_model_len=max_model_len,
++                disable_log_stats=config.disable_log_stats,
++                max_num_batched_tokens=max_num_batched_tokens,
++                enable_chunked_prefill=config.enable_chunked_prefill,
++                enable_prefix_caching=True,
++                seed=config.get("seed", 0),
++            )
+ 
+         # Offload vllm model to reduce peak memory usage
+         self.inference_engine.sleep(level=1)
+diff --git a/pyproject.toml b/pyproject.toml
+index 23741b4a..799ee750 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -43,10 +43,10 @@ dependencies = [
+     "pybind11",
+     "pylatexenc",
+     "ray>=2.10",
+-    "tensordict<0.6",
++    "tensordict==0.6.2",
+     "torchdata",
+     "transformers",
+-    "vllm<=0.6.3",
++    "vllm==0.8.2",
+     'wandb',
+ ]
+ 
+diff --git a/setup.py b/setup.py
+index cf9001eb..06d6eedf 100644
+--- a/setup.py
++++ b/setup.py
+@@ -35,10 +35,10 @@ install_requires = [
+   'pybind11',
+   'pylatexenc',
+   'ray>=2.10',
+-  'tensordict<0.6',
++  'tensordict==0.6.2',
+   'torchdata',
+   'transformers',
+-  'vllm<=0.6.3',
++  'vllm==0.8.2',
+   'wandb',
+ ]
+ 
+@@ -75,4 +75,4 @@ setup(
+     include_package_data=True,
+     long_description=long_description,
+     long_description_content_type='text/markdown'
+-)
+\ No newline at end of file
++)

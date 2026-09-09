@@ -1,0 +1,5 @@
+mani-skill==3.0.0b20
+numba==0.60.0
+sapien==3.0.0b1
+transforms3d==0.4.2
+

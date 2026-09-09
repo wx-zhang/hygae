@@ -1,0 +1,18 @@
+train_and_base_eval:
+  env_name: navigation
+  env_config:
+    render_mode: vision
+    prompt_format: grounding_worldmodeling
+    use_state_reward: true
+    eval_set: base
+  train_size: 10000
+  test_size: 128
+common_sense_eval:
+  env_name: navigation
+  env_config:
+    render_mode: vision
+    prompt_format: grounding_worldmodeling
+    use_state_reward: true
+    eval_set: common_sense
+  train_size: 0
+  test_size: 128

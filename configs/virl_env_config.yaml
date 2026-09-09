@@ -1,0 +1,42 @@
+# Download the published SFTvsRL_Data bundle and set VIRL_DATA_ROOT to its
+# VIRL_routes directory. No SFTvsRL code checkout is needed.
+train:
+  env_name: virl
+  env_config:
+    route_info_path: $VIRL_DATA_ROOT/nyc_1k_routes/route_infos.json
+    panorama_dir: $VIRL_DATA_ROOT/nyc_1k_routes/street_views
+    gps_to_pano_path: $VIRL_DATA_ROOT/nyc_1k_routes/gps_pano_mapping.pkl
+    resolution: 320
+    language_only: false
+    absolute_action: true
+    relocation: false
+    drop_rate: 0.0
+    straight_line_length: 2
+    max_actions_per_step: 10
+    prompt_format: grounding_worldmodeling
+    format_reward: 0.5
+    mapping_radius: 50
+    oracle_radius: 20
+    intersection_valid_radius: 10
+  train_size: 1000
+  test_size: 32
+validation:
+  env_name: virl
+  env_config:
+    route_info_path: $VIRL_DATA_ROOT/VLN_mini/route_infos.json
+    panorama_dir: $VIRL_DATA_ROOT/VLN_mini/street_views
+    gps_to_pano_path: $VIRL_DATA_ROOT/VLN_mini/gps_pano_mapping.pkl
+    resolution: 320
+    language_only: false
+    absolute_action: true
+    relocation: false
+    drop_rate: 0.0
+    straight_line_length: 2
+    max_actions_per_step: 10
+    prompt_format: grounding_worldmodeling
+    format_reward: 0.5
+    mapping_radius: 50
+    oracle_radius: 20
+    intersection_valid_radius: 10
+  train_size: 0
+  test_size: 18
